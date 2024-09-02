@@ -1,0 +1,7 @@
+beautifulsoup4
+coloredlogs
+lxml
+openpyxl
+pandas
+PyQt6
+selenium
