@@ -32,6 +32,40 @@ OUTPUT_PATH = Path(config["DEFAULT"]["OutputPath"])
 WINDOW_WIDTH = 300
 WINDOW_HEIGHT = 200
 LOCAL_THREAD = threading.local()
+TEAM_MAPPING = {
+    "ARI": "Arizona Cardinals",
+    "ATL": "Atlanta Falcons",
+    "BAL": "Baltimore Ravens",
+    "BUF": "Buffalo Bills",
+    "CAR": "Carolina Panthers",
+    "CHI": "Chicago Bears",
+    "CIN": "Cincinnati Bengals",
+    "CLE": "Cleveland Browns",
+    "DAL": "Dallas Cowboys",
+    "DEN": "Denver Broncos",
+    "DET": "Detroit Lions",
+    "GB": "Green Bay Packers",
+    "HOU": "Houston Texans",
+    "IND": "Indianapolis Colts",
+    "JAX": "Jacksonville Jaguars",
+    "KC": "Kansas City Chiefs",
+    "LAC": "Los Angeles Chargers",
+    "LAR": "Los Angeles Rams",
+    "LV": "Las Vegas Raiders",
+    "MIA": "Miami Dolphins",
+    "MIN": "Minnesota Vikings",
+    "NE": "New England Patriots",
+    "NO": "New Orleans Saints",
+    "NYG": "New York Giants",
+    "NYJ": "New York Jets",
+    "PHI": "Philadelphia Eagles",
+    "PIT": "Pittsburgh Steelers",
+    "SEA": "Seattle Seahawks",
+    "SF": "San Francisco 49ers",
+    "TB": "Tampa Bay Buccaneers",
+    "TEN": "Tennessee Titans",
+    "WAS": "Washington Commanders",
+}
 
 
 class ScraperWorker(QThread):
@@ -55,50 +89,41 @@ class ScraperWorker(QThread):
                 if not self.scraping_active:
                     self.progress.emit("Scraping stopped by user.")
                     break
-                self.driver.get(f"{WEB_URL}-{week}")
+                current_year = datetime.now().year
+                self.driver.get(f"{WEB_URL}/?Year={current_year}&Week={week}")
                 WebDriverWait(self.driver, TIMEOUT).until(
                     EC.presence_of_element_located((By.TAG_NAME, "table"))
                 )
                 soup = BeautifulSoup(self.driver.page_source, "lxml")
                 tables = soup.find_all("table")
-
-                dataframes = []
-                for table in tables:
-                    table_data = pd.read_html(StringIO(str(table)))[0]
-                    table_data.columns = ["Matchup"] + list(table_data.columns[1:])
-                    dataframes.append(table_data)
-
-                all_odds = pd.concat(dataframes, ignore_index=True)
-                all_odds["Matchup"] = all_odds["Matchup"].apply(
-                    lambda x: re.sub(r"^\d{1,2}:\d{2}[AP]M\w{2,3}\s*", "", x)
-                )
-                all_odds["Spread"] = all_odds["Spread"].apply(
-                    lambda x: (
-                        re.search(r"[-+]?\d+(\.\d+)?", x).group()
-                        if re.search(r"[-+]?\d+(\.\d+)?", x)
-                        else x
+                all_odds = pd.read_html(StringIO(str(tables)))[1]
+                all_odds.columns = ["Time", "Team", "Spread", "Moneyline", "Total"]
+                all_odds["Team"] = all_odds["Team"].replace(TEAM_MAPPING)
+                all_odds = all_odds[
+                    ~all_odds.apply(
+                        lambda row: row.astype(str).str.contains("Spread|Moneyline|Total").any(),
+                        axis=1,
                     )
-                )
-                all_odds["Total"] = all_odds["Total"].apply(
-                    lambda x: (
-                        re.search(r"\d+(\.\d+)?", x).group() if re.search(r"\d+(\.\d+)?", x) else x
-                    )
-                )
+                ]
+                all_odds["Spread"] = all_odds["Spread"].apply(lambda x: x.replace("−", "-"))
                 all_odds["Moneyline"] = all_odds["Moneyline"].apply(lambda x: x.replace("−", "-"))
-                all_odds["Spread"] = pd.to_numeric(all_odds["Spread"])
-                all_odds["Total"] = pd.to_numeric(all_odds["Total"])
-                all_odds["Moneyline"] = pd.to_numeric(all_odds["Moneyline"])
+                all_odds["Total"] = all_odds["Total"].apply(lambda x: re.sub(r"[^\d.]", "", x))
+                all_odds["Spread"] = pd.to_numeric(all_odds["Spread"], errors="coerce")
+                all_odds["Moneyline"] = pd.to_numeric(all_odds["Moneyline"], errors="coerce")
+                all_odds["Total"] = pd.to_numeric(all_odds["Total"], errors="coerce")
 
-                current_year = datetime.now().year
                 output_file = Path(f"{OUTPUT_PATH}/{current_year-2000:02}{week:02}.xlsx")
                 output_file.parent.mkdir(exist_ok=True, parents=True)
                 with pd.ExcelWriter(output_file) as writer:
                     all_odds.to_excel(writer, index=False)
                 self.progress.emit(f"Week {week} data scraped successfully.")
+                log.info("Week %s data scraped successfully.", week)
         except (ValueError, WebDriverException) as error:
             self.error.emit(f"An error occurred: {error}")
+            log.info("An error occurred: %s", error)
         finally:
             self.finished.emit()
+            log.info("Scraping process finished.")
 
     def stop(self):
         """Stops the scraping process."""
