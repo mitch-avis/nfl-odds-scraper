@@ -3,5 +3,6 @@ coloredlogs
 lxml
 openpyxl
 pandas
+pyinstaller
 PyQt6
 selenium

@@ -36,5 +36,6 @@ LOGGING_CONFIG = {
 
 # Apply the logging configuration
 dictConfig(LOGGING_CONFIG)
+
 # Create a logger instance for use throughout the application
 log = logging.getLogger()
