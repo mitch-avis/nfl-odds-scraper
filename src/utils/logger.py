@@ -1,7 +1,18 @@
-"""Implements a formatted logger for the application."""
+"""Implements a formatted logger for the application.
+
+Adds optional file logging when LOG_PATH is configured in constants.
+Works both in dev and in frozen PyInstaller builds.
+"""
 
 import logging
+import os
 from logging.config import dictConfig
+
+try:
+    # Local import to avoid circulars for constants import in logger config
+    from constants import LOG_PATH
+except ImportError:  # pragma: no cover - defensive
+    LOG_PATH = None
 
 # Configure the logging format and handler
 LOGGING_CONFIG = {
@@ -24,6 +35,7 @@ LOGGING_CONFIG = {
             "class": "logging.StreamHandler",
             "stream": "ext://sys.stderr",
         },
+        # "file" handler will be added dynamically if LOG_PATH provided
     },
     "loggers": {
         "root": {
@@ -33,6 +45,21 @@ LOGGING_CONFIG = {
         },
     },
 }
+
+# Add a file handler if configured
+if LOG_PATH:
+    try:
+        os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+    except OSError:
+        pass
+    LOGGING_CONFIG["handlers"]["file"] = {
+        "level": "DEBUG",
+        "class": "logging.FileHandler",
+        "filename": str(LOG_PATH),
+        "encoding": "utf-8",
+        "formatter": "default",
+    }
+    LOGGING_CONFIG["loggers"]["root"]["handlers"].append("file")
 
 # Apply the logging configuration
 dictConfig(LOGGING_CONFIG)
