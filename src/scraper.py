@@ -6,18 +6,33 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urljoin
 
 import pandas as pd
 from bs4 import BeautifulSoup
 from PyQt6.QtCore import QThread, pyqtSignal
 from selenium import webdriver
-from selenium.common.exceptions import TimeoutException, WebDriverException
+from selenium.common.exceptions import (
+    ElementClickInterceptedException,
+    NoSuchElementException,
+    StaleElementReferenceException,
+    TimeoutException,
+    WebDriverException,
+)
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
-from constants import DEFAULT_TOTAL, OUTPUT_PATH, TEAM_NICKNAME_TO_FULL, TIMEOUT, WEB_URL
+from constants import (
+    DEFAULT_MONEYLINE,
+    DEFAULT_SPREAD,
+    DEFAULT_TOTAL,
+    OUTPUT_PATH,
+    TEAM_NICKNAME_TO_FULL,
+    TIMEOUT,
+    WEB_URL,
+)
 from utils.logger import log
 
 
@@ -36,7 +51,7 @@ class ScraperWorker(QThread):
         self.driver = self.get_webdriver()
 
     def run(self):
-        """Scrapes NFL odds for the specified weeks from VegasInsider.
+        """Scrapes NFL odds for the specified weeks.
 
         Per requirements:
         - Only Consensus column is used for Spread, Total, Moneyline.
@@ -211,7 +226,6 @@ class ScraperWorker(QThread):
         options.add_argument("--disable-software-rasterizer")
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
-        options.add_argument("--start-maximized")
         options.add_argument("--disable-infobars")
         options.add_argument("--disable-extensions")
         options.add_argument("--no-first-run")
@@ -271,40 +285,140 @@ class ScraperWorker(QThread):
     # -----------------------------
 
     def _select_week(self, week: int):
-        """Open the Week dropdown and select the desired week (Week N)."""
-        # Click the Week span (provided XPath)
-        week_span_xpath = "/html/body/section/section/article/div[3]/header/div/div/div/div[2]/span"
-        week_span = WebDriverWait(self.driver, TIMEOUT).until(
-            EC.element_to_be_clickable((By.XPATH, week_span_xpath))
+        """Open the Week dropdown and select the desired week (Week N) robustly.
+
+        Strategy:
+        - Prefer stable CSS selectors over brittle absolute XPaths.
+        - If the desired week is already selected, return early.
+        - Click the week picker using JS click with retries to avoid intercepts.
+        - Wait for the active menu to appear, then click the desired week.
+        - Wait for either the header text to reflect the new week and the odds table to refresh
+          (staleness of previous tbody), or fall back to direct navigation via the option's
+          data-endpoint if UI interaction fails.
+        """
+        driver = self.driver
+
+        # Locators
+        week_picker_span_locator = (
+            By.CSS_SELECTOR,
+            ".filters-week-picker .week-picker-week > span[data-content='#week-picker-week']",
+        )
+        week_menu_locator = (By.ID, "week-picker-week")
+        week_menu_active_locator = (
+            By.CSS_SELECTOR,
+            "ul#week-picker-week.menu.active",
+        )
+        # A table element to use for staleness detection
+        table_locator = (By.CSS_SELECTOR, "tbody#odds-table-spread--0")
+
+        wait = WebDriverWait(driver, TIMEOUT)
+
+        # Early exit if already selected
+        picker_span = wait.until(EC.presence_of_element_located(week_picker_span_locator))
+        current_text = picker_span.text.strip()
+        if current_text.lower().startswith("week ") and current_text.strip() == f"Week {week}":
+            log.debug("Week %s already selected; skipping dropdown interaction", week)
+            return
+
+        # Capture existing table for staleness wait
+        try:
+            old_table = driver.find_element(*table_locator)
+        except NoSuchElementException:
+            old_table = None
+
+        # Open the menu (retry a couple of times in case of intercepts)
+        for attempt in range(3):
+            try:
+                wait.until(EC.element_to_be_clickable(week_picker_span_locator))
+                driver.execute_script(
+                    "arguments[0].scrollIntoView({block:'center'});",
+                    driver.find_element(*week_picker_span_locator),
+                )
+                driver.execute_script(
+                    "arguments[0].click();",
+                    driver.find_element(*week_picker_span_locator),
+                )
+                # Wait for menu to be visible and active
+                wait.until(EC.visibility_of_element_located(week_menu_locator))
+                try:
+                    wait.until(EC.presence_of_element_located(week_menu_active_locator))
+                except TimeoutException:
+                    # Some builds don't toggle 'active' class; continue if visible
+                    pass
+                break
+            except (
+                ElementClickInterceptedException,
+                StaleElementReferenceException,
+                TimeoutException,
+            ) as exception:
+                log.debug("Attempt %s to open week menu failed: %s", attempt + 1, exception)
+                if attempt == 2:
+                    log.warning(
+                        "Falling back to direct navigation for week %s (unable to open menu)",
+                        week,
+                    )
+                else:
+                    continue
+
+        # Try clicking the desired week option; on failure, attempt direct navigation
+        option_xpath = (
+            f"//ul[@id='week-picker-week']//li[.//span[normalize-space() = 'Week {week}']]"
         )
         try:
-            self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", week_span)
-        except WebDriverException:
-            pass
-        week_span.click()
+            option_li = wait.until(EC.presence_of_element_located((By.XPATH, option_xpath)))
+            # Grab the target endpoint for fallback/navigation verification
+            endpoint = option_li.get_attribute("data-endpoint")
+            # Click the inner span to select the option
+            option_span = option_li.find_element(By.TAG_NAME, "span")
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", option_span)
+            driver.execute_script("arguments[0].click();", option_span)
 
-        # The dropdown options appear under the same container; select the target text
-        # Look for any span with exact text 'Week {week}' in the dropdown list
-        header_ul_xpath = "/html/body/section/section/article/div[3]/header/div/div/div/div[2]/ul"
-        WebDriverWait(self.driver, TIMEOUT).until(
-            EC.visibility_of_element_located((By.XPATH, header_ul_xpath))
-        )
-        option_xpath = f"{header_ul_xpath}//span[normalize-space() = 'Week {week}']"
-        WebDriverWait(self.driver, TIMEOUT).until(
-            EC.element_to_be_clickable((By.XPATH, option_xpath))
-        ).click()
+            # Wait for header to reflect selected week
+            wait.until(EC.text_to_be_present_in_element(week_picker_span_locator, f"Week {week}"))
+            # Wait for table refresh
+            if old_table is not None:
+                try:
+                    wait.until(EC.staleness_of(old_table))
+                except TimeoutException:
+                    # If staleness didn't trigger, ensure table is present at least
+                    wait.until(EC.presence_of_element_located(table_locator))
+            else:
+                wait.until(EC.presence_of_element_located(table_locator))
+        except TimeoutException as exception:
+            log.warning("Timeout selecting Week %s via UI: %s", week, exception)
+            # Fallback to direct navigation using the endpoint from the option, if available
+            try:
+                option_li = driver.find_element(By.XPATH, option_xpath)
+                endpoint = option_li.get_attribute("data-endpoint")
+            except NoSuchElementException:
+                endpoint = None
 
-        # Ensure the selected value is reflected in the Week span text
-        WebDriverWait(self.driver, TIMEOUT).until(
-            EC.text_to_be_present_in_element((By.XPATH, week_span_xpath), f"Week {week}")
-        )
+            if endpoint:
 
-        # Wait a moment for the table to refresh
-        WebDriverWait(self.driver, TIMEOUT).until(
-            EC.presence_of_element_located(
-                (By.XPATH, "/html/body/section/section/article/div[3]/div")
+                target_url = urljoin(WEB_URL, endpoint)
+                log.info("Navigating directly to %s (fallback)", target_url)
+                driver.get(target_url)
+                # Wait for header and table to be ready
+                wait.until(EC.presence_of_element_located(table_locator))
+                try:
+                    wait.until(
+                        EC.text_to_be_present_in_element(week_picker_span_locator, f"Week {week}")
+                    )
+                except TimeoutException:  # not critical; proceed if table loaded
+                    pass
+            else:
+                # As a last resort, try constructing the URL pattern
+                current_year = datetime.now().year
+                candidate = f"{WEB_URL}?week={current_year}-reg-{week}&table=true"
+                log.info("No endpoint available; navigating to constructed URL %s", candidate)
+                driver.get(candidate)
+                wait.until(EC.presence_of_element_located(table_locator))
+        except WebDriverException as exception:
+            log.warning(
+                "Unexpected error during week selection; proceeding if tables present: %s",
+                exception,
             )
-        )
+            wait.until(EC.presence_of_element_located(table_locator))
 
     @staticmethod
     def _find_consensus_index(tbody) -> int:
@@ -390,23 +504,33 @@ class ScraperWorker(QThread):
             else cell.get_text(strip=True)
         )
         raw = self._clean_value_text(raw)
-        if not raw or raw.upper() == "N/A":
-            return ""
+        norm = raw.strip().lower().replace("’", "'")
+        is_missing = (not norm) or norm in {"n/a", "na"}
+        is_pick = any(token in norm for token in ["pk", "pick", "pick'em", "pickem"])
+        is_even = "even" in norm
 
         if market == "spread":
-            if raw.upper() == "PK":
-                return "0.0"
+            if is_missing or is_pick:
+                return f"{float(DEFAULT_SPREAD):.1f}"
             # Expect forms like '+10', '-3.5'
             match_result = re.search(r"^[+\-]?\d+(?:\.\d+)?", raw)
-            return match_result.group(0) if match_result else ""
+            return match_result.group(0) if match_result else f"{float(DEFAULT_SPREAD):.1f}"
         if market == "moneyline":
+            if is_missing or is_even or is_pick:
+                return str(int(DEFAULT_MONEYLINE))
             # Forms like '+380', '-165'
             match_result = re.search(r"^[+\-]?\d+", raw)
-            return match_result.group(0) if match_result else ""
+            return match_result.group(0) if match_result else str(int(DEFAULT_MONEYLINE))
         if market == "total":
+            if is_missing:
+                return f"{float(DEFAULT_TOTAL):.1f}"
             # Forms like 'o47.5' or 'u47.5' -> extract the number only
             match_result = re.search(r"\d+(?:\.\d+)?", raw)
-            return f"{float(match_result.group(0)):.1f}" if match_result else DEFAULT_TOTAL
+            return (
+                f"{float(match_result.group(0)):.1f}"
+                if match_result
+                else f"{float(DEFAULT_TOTAL):.1f}"
+            )
         return raw
 
     def _to_mountain_time(self, time_cell_text: str) -> str:
